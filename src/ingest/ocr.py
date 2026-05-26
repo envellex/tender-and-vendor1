@@ -88,7 +88,7 @@ def ocr_pdf_if_needed(pdf_path: str) -> Optional[str]:
 
     texts = []
     for page in doc:
-        pix = page.get_pixmap(dpi=200)
+        pix = page.get_pixmap(dpi=150)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         text = pytesseract.image_to_string(img)
         texts.append(text)

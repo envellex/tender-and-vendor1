@@ -113,7 +113,7 @@ def parse_pdf_blocks(pdf_path: str) -> List[Dict]:
                     ocr_skip_logged = True
                 continue
             try:
-                pix = page.get_pixmap(dpi=200)
+                pix = page.get_pixmap(dpi=150)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 ocr_text = pytesseract.image_to_string(img).strip()
                 if ocr_text:
