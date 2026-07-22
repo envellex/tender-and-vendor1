@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import threading
 import uuid
@@ -204,8 +205,52 @@ def _db_path() -> Path:
     return PROJECT_ROOT / "data" / "parsed" / "app.db"
 
 
+def _safe_output_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "_", name.strip())
+    return cleaned or "file"
+
+
+def _latest_summary_report() -> Path:
+    output_dir = PROJECT_ROOT / "data" / "output"
+    candidates = sorted(
+        output_dir.glob("vendor_comparison_matrix*.xlsx"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if candidates:
+        return candidates[0]
+    return output_dir / "vendor_comparison_matrix.xlsx"
+
+
+def _latest_vendor_report(vendor_id: str) -> Path:
+    output_dir = PROJECT_ROOT / "data" / "output"
+    safe_name = _safe_output_name(Path(vendor_id).name)
+    candidates = sorted(
+        output_dir.glob(f"vendor_{safe_name}*.xlsx"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if candidates:
+        return candidates[0]
+    return output_dir / f"vendor_{safe_name}.xlsx"
+
+
+def _output_file_path(file_name: str) -> Path:
+    output_dir = PROJECT_ROOT / "data" / "output"
+    safe_name = Path(file_name).name
+    file_path = output_dir / safe_name
+    try:
+        if not file_path.exists():
+            raise FileNotFoundError
+        if file_path.resolve().parent != output_dir.resolve():
+            raise FileNotFoundError
+    except OSError:
+        raise HTTPException(status_code=404, detail=f"Output file not found: {file_name}")
+    return file_path
+
+
 def _report_path() -> Path:
-    return PROJECT_ROOT / "data" / "output" / "vendor_comparison_matrix.xlsx"
+    return _latest_summary_report()
 
 
 def _incoming_dir() -> Path:
@@ -271,6 +316,9 @@ def _set_run_state(run_id: str, status_value: str, message: str = "", progress: 
 def _run_pipeline_job(run_id: str) -> None:
     try:
         _set_run_state(run_id, "running", "Pipeline started", 0.0)
+        # Always reuse parsed PDF blocks — keeps LLM warm-up fast and avoids
+        # re-parsing PDFs that haven't changed.
+        os.environ.setdefault("FAST_REUSE_PARSED", "1")
         run_pipeline_main(run_id=run_id)
         _set_run_state(run_id, "completed", "Pipeline completed", 100.0)
     except Exception as exc:
@@ -323,6 +371,30 @@ def files_endpoint(_: None = Depends(require_localhost)) -> dict:
     return {"incoming": files}
 
 
+@app.delete("/files/{file_name}")
+def delete_incoming_file(file_name: str, _: None = Depends(require_localhost)) -> dict:
+    """Remove a file from data/incoming so it won't be picked up by the next pipeline run."""
+    safe_name = Path(file_name).name          # strip any path traversal
+    target = _incoming_dir() / safe_name
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {safe_name}")
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail=f"Not a file: {safe_name}")
+    # Prevent deleting the master workbook while a pipeline is running
+    _ensure_app_db()
+    conn = get_connection(str(_db_path()))
+    try:
+        active = conn.execute(
+            "SELECT run_id FROM pipeline_runs WHERE status IN ('queued','running') LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if active:
+        raise HTTPException(status_code=409, detail="Cannot delete files while pipeline is running")
+    target.unlink()
+    return {"deleted": safe_name}
+
+
 @app.post("/upload", response_model=UploadResponse)
 def upload_files(files: list[UploadFile] = File(...), _: None = Depends(require_localhost)) -> dict:
     incoming = PROJECT_ROOT / "data" / "incoming"
@@ -363,6 +435,25 @@ def run_pipeline_endpoint(_: None = Depends(require_localhost)) -> dict:
         ).fetchone()
         if active:
             raise HTTPException(status_code=409, detail=f"Pipeline already active: {active[0]}")
+
+        # ── Fresh run: clear compliance results for all current incoming vendors ──
+        # PDF parse cache (parsed_documents) is intentionally kept so re-parsing
+        # is skipped and the LLM warms up faster on the next run.
+        incoming = _incoming_dir()
+        current_vendors = [p.stem for p in incoming.glob("*.pdf")]
+        if current_vendors:
+            placeholders = ",".join("?" * len(current_vendors))
+            deleted = conn.execute(
+                f"DELETE FROM compliance_matrix WHERE vendor_id IN ({placeholders})",
+                current_vendors,
+            ).rowcount
+            if deleted:
+                conn.execute(
+                    "INSERT INTO audit_log (action, entity_type, entity_id, details) VALUES (?, ?, ?, ?)",
+                    ("fresh_run_clear", "compliance_matrix", run_id,
+                     json.dumps({"vendors": current_vendors, "rows_cleared": deleted})),
+                )
+
         conn.execute(
             "INSERT OR REPLACE INTO pipeline_runs (run_id, status, progress, message, error, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
             (run_id, "queued", 0.0, "Queued", ""),
@@ -745,11 +836,17 @@ def output_files_endpoint(_: None = Depends(require_localhost)) -> dict:
     return {"files": files}
 
 
+@app.get("/output/{file_name}")
+def output_file_endpoint(file_name: str, _: None = Depends(require_localhost)):
+    output_path = _output_file_path(file_name)
+    return FileResponse(str(output_path), filename=output_path.name)
+
+
 @app.get("/report/vendor/{vendor_id}")
 def vendor_report_endpoint(vendor_id: str, _: None = Depends(require_localhost)):
     """Download the per-vendor compliance file."""
     safe_name = Path(vendor_id).name  # strip any path traversal
-    vendor_path = PROJECT_ROOT / "data" / "output" / f"vendor_{safe_name}.xlsx"
+    vendor_path = _latest_vendor_report(safe_name)
     if not vendor_path.exists():
         raise HTTPException(status_code=404, detail=f"Vendor report not found: vendor_{safe_name}.xlsx")
     return FileResponse(str(vendor_path), filename=vendor_path.name)

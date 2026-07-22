@@ -117,6 +117,11 @@ export async function downloadVendorReport(vendorId) {
   return response.blob()
 }
 
+export async function downloadOutputFile(fileName) {
+  const response = await request(`/output/${encodeURIComponent(fileName)}`)
+  return response.blob()
+}
+
 export async function getOllamaStatus() {
   const response = await request('/ollama-status')
   return response.json()
@@ -124,6 +129,11 @@ export async function getOllamaStatus() {
 
 export async function getOutputFiles() {
   const response = await request('/output-files')
+  return response.json()
+}
+
+export async function deleteIncomingFile(fileName) {
+  const response = await request(`/files/${encodeURIComponent(fileName)}`, { method: 'DELETE' })
   return response.json()
 }
 

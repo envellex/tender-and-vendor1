@@ -2,7 +2,10 @@
 import logging
 import json
 import os
+import shutil
 import uuid
+import traceback
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 from src.ingest.excel_parser import parse_master_excel
@@ -18,32 +21,42 @@ from src.evaluator import retrain_from_feedback
 
 def _load_blocks_from_db(cur, file_name: str) -> list[dict]:
     rows = cur.execute(
-        "SELECT page, bbox, text FROM parsed_documents WHERE file_name=? ORDER BY page, doc_id",
+        "SELECT doc_id, page, bbox, text FROM parsed_documents WHERE file_name=? ORDER BY page, doc_id",
         (file_name,),
     ).fetchall()
     blocks = []
-    for page, bbox, text in rows:
+    for doc_id, page, bbox, text in rows:
         try:
             parsed_bbox = json.loads(bbox)
         except Exception:
             parsed_bbox = bbox
-        blocks.append({"page": page, "bbox": parsed_bbox, "text": text})
+        blocks.append({"doc_id": doc_id, "page": page, "bbox": parsed_bbox, "text": text})
     return blocks
 
 
 def _citation_doc_id(vendor_id: str, top_blocks: list[dict]) -> str | None:
     if not top_blocks:
         return None
+    doc_id = top_blocks[0].get("doc_id")
+    if isinstance(doc_id, str) and doc_id:
+        return doc_id
     page = top_blocks[0].get("page")
     return f"{vendor_id}:{page}:0" if page is not None else None
 
 
 def _pick_master_workbook(cfg_in: Path) -> Path | None:
-    preferred = cfg_in / "Tech_Comp_check_list.xlsx"
-    if preferred.exists():
-        return preferred
+    # Prefer the most recently modified Tech_Comp_check_list variant first,
+    # then fall back to any other .xlsx in the directory.
+    tech_variants = sorted(
+        cfg_in.glob("Tech_Comp_check_list*.xlsx"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,   # newest first
+    )
+    if tech_variants:
+        return tech_variants[0]
     candidates = sorted(
-        path for path in cfg_in.glob("*.xlsx") if path.name.lower() != "tech_comp_check_list.xlsx"
+        path for path in cfg_in.glob("*.xlsx")
+        if not path.name.lower().startswith("tech_comp_check_list")
     )
     return candidates[0] if candidates else None
 
@@ -120,6 +133,17 @@ def main(run_id: str | None = None, progress_cb: Optional[Callable[[float, str],
     finally:
         conn_for_profile.close()
 
+    # ── Optional sheet filter: PIPELINE_SHEET_FILTER=NB01,PC01 ──────────────
+    _sheet_filter_raw = os.environ.get("PIPELINE_SHEET_FILTER", "").strip()
+    if _sheet_filter_raw:
+        _allowed_sheets = {s.strip() for s in _sheet_filter_raw.split(",") if s.strip()}
+        before = len(specs)
+        specs = [s for s in specs if s.get("sheet_name", "") in _allowed_sheets]
+        logging.info(
+            "PIPELINE_SHEET_FILTER=%s: kept %d/%d specs",
+            _sheet_filter_raw, len(specs), before,
+        )
+
     fast_mode = _bool_env("FAST_MODE")
     if fast_mode:
         os.environ.setdefault("FAST_SKIP_OCR", "1")
@@ -150,6 +174,20 @@ def main(run_id: str | None = None, progress_cb: Optional[Callable[[float, str],
     if not vendor_files:
         logging.error("No vendor PDFs found in data/incoming")
         return
+
+    # ── Optional vendor filter: PIPELINE_VENDOR_FILTER=product-pdf,vendorB ──
+    _vendor_filter_raw = os.environ.get("PIPELINE_VENDOR_FILTER", "").strip()
+    if _vendor_filter_raw:
+        _allowed_vendors = {v.strip() for v in _vendor_filter_raw.split(",") if v.strip()}
+        before = len(vendor_files)
+        vendor_files = [v for v in vendor_files if v.stem in _allowed_vendors]
+        logging.info(
+            "PIPELINE_VENDOR_FILTER=%s: kept %d/%d PDFs",
+            _vendor_filter_raw, len(vendor_files), before,
+        )
+        if not vendor_files:
+            logging.error("No vendor PDFs remain after PIPELINE_VENDOR_FILTER — check PDF stem names")
+            return
 
     vendor_limit = _int_env("FAST_VENDOR_LIMIT", 0)
     if vendor_limit and len(vendor_files) > vendor_limit:
@@ -236,6 +274,7 @@ def main(run_id: str | None = None, progress_cb: Optional[Callable[[float, str],
                 )
                 for i, b in enumerate(blocks):
                     doc_id = f"{vendor_id}:{b['page']}:{i}"
+                    b["doc_id"] = doc_id
                     cur.execute(
                         "INSERT OR REPLACE INTO parsed_documents (doc_id, file_name, page, bbox, text) VALUES (?, ?, ?, ?, ?)",
                         (doc_id, v.name, b["page"], str(b["bbox"]), b["text"]),
@@ -353,17 +392,21 @@ def main(run_id: str | None = None, progress_cb: Optional[Callable[[float, str],
         logging.info("Dispatch stats: %s", stats)
 
         # â”€â”€ Phase 3: Build report â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        history_tag = f"{timestamp}_{run_id[:8]}"
         _update_progress(cur, conn, run_id, 91.0, "Building Excel reportâ€¦", progress_cb)
         cur.execute(
             "INSERT INTO audit_log (action, entity_type, entity_id, details) VALUES (?, ?, ?, ?)",
-            ("pipeline_complete", "run", run_id, json.dumps({"output": str(cfg_out / "vendor_comparison_matrix.xlsx")})),
+            ("pipeline_complete", "run", run_id, json.dumps({"history_tag": history_tag})),
         )
         conn.commit()
 
-    except Exception as exc:
+    except Exception:
+        error_details = traceback.format_exc()
+        logging.exception("Pipeline failed")
         cur.execute(
             "UPDATE pipeline_runs SET status=?, error=?, message=?, updated_at=CURRENT_TIMESTAMP WHERE run_id=?",
-            ("failed", str(exc), "Pipeline failed", run_id),
+            ("failed", error_details, "Pipeline failed", run_id),
         )
         conn.commit()
         raise
@@ -371,9 +414,13 @@ def main(run_id: str | None = None, progress_cb: Optional[Callable[[float, str],
         conn.close()
 
     # build report (outside the connection so it doesn't hold the lock)
-    out_path = cfg_out / "vendor_comparison_matrix.xlsx"
-    build_excel_report(str(out_path), db_path=str(cfg_db))
-    logging.info(f"Report written to {out_path}")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    history_tag = f"{timestamp}_{run_id[:8]}"
+    out_path = cfg_out / f"vendor_comparison_matrix_{history_tag}.xlsx"
+    build_excel_report(str(out_path), db_path=str(cfg_db), history_tag=history_tag)
+    latest_path = cfg_out / "vendor_comparison_matrix.xlsx"
+    shutil.copy2(out_path, latest_path)
+    logging.info(f"Report written to {out_path} and latest copy to {latest_path}")
 
     # final status update
     conn2 = get_connection(str(cfg_db))

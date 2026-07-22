@@ -67,14 +67,62 @@ def _normalize_text(text: str) -> str:
     return " ".join((text or "").split())
 
 
+def _make_dispatch_result(
+    spec_id: str,
+    vendor_id: str,
+    status: str,
+    citation: str,
+    reasoning: str,
+    confidence: float,
+    citation_page: Optional[int] = None,
+    citation_bbox: Optional[List[float]] = None,
+    technical: Optional[Dict[str, Any]] = None,
+    risk: Optional[Dict[str, Any]] = None,
+    fallback: Optional[Dict[str, Any]] = None,
+    top_blocks: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Return a canonical dispatch result with consistent keys.
+
+    Ensures `technical`, `risk`, and `fallback` are dicts with at least
+    `status` and `confidence` keys (or empty dicts) so downstream DB inserts
+    and consumers don't see shape variance.
+    """
+    technical = technical or {}
+    risk = risk or {}
+    fallback = fallback or {}
+    def _norm_agent(a: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(a, dict):
+            return {}
+        return {
+            "status": a.get("status"),
+            "confidence": float(a.get("confidence", 0.0)) if a.get("confidence") is not None else None,
+            **{k: v for k, v in a.items() if k not in {"status", "confidence"}},
+        }
+
+    return {
+        "spec_id": spec_id,
+        "vendor_id": vendor_id,
+        "status": status,
+        "citation": citation,
+        "reasoning": reasoning,
+        "confidence": float(confidence or 0.0),
+        "citation_page": citation_page,
+        "citation_bbox": citation_bbox,
+        "technical": _norm_agent(technical),
+        "risk": _norm_agent(risk),
+        "fallback": _norm_agent(fallback),
+        "top_blocks": top_blocks or [],
+    }
+
+
 @dataclass(frozen=True)
 class VendorIndex:
-    blocks: List[Dict[str, Any]]
-    block_tokens: List[List[str]]
-    block_token_counts: List[Counter]
+    blocks: Tuple[Dict[str, Any], ...]
+    block_tokens: Tuple[Tuple[str, ...], ...]
+    block_token_counts: Tuple[Counter, ...]
     idf: Dict[str, float]
     avg_block_len: float
-    block_texts_norm: List[str]
+    block_texts_norm: Tuple[str, ...]
 
     @classmethod
     def build(cls, blocks: Sequence[Dict[str, Any]]) -> "VendorIndex":
@@ -102,12 +150,12 @@ class VendorIndex:
             for token, freq in doc_freq.items()
         }
         return cls(
-            blocks=block_list,
-            block_tokens=block_tokens,
-            block_token_counts=block_token_counts,
+            blocks=tuple(block_list),
+            block_tokens=tuple(tuple(bt) for bt in block_tokens),
+            block_token_counts=tuple(block_token_counts),
             idf=idf,
             avg_block_len=avg_block_len,
-            block_texts_norm=block_texts_norm,
+            block_texts_norm=tuple(block_texts_norm),
         )
 
 
@@ -131,12 +179,90 @@ def _score_block_with_index(spec_counts: Counter, block_counts: Counter, block_l
     return score
 
 
+def _extract_spec_numbers(text: str) -> set:
+    """Extract numbers with their unit context to avoid false ratio matches.
+
+    "Minimum 16 GB DDR5 RAM 4800 MT/s" → {"16 gb", "4800 mt/s", "32 gb"}
+    "Native aspect ratio 16:9"          → {} (16:9 is a ratio, not a spec value)
+
+    A number is considered a spec value when it is:
+      - followed by a unit (letters/%) with optional space, OR
+      - a standalone integer not immediately followed or preceded by ':'
+    """
+    results: set = set()
+    # Match number + unit (e.g. "16 GB", "4800MT/s", "1 TB", "230V")
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*([a-zA-Z/%]+)", text):
+        results.add(f"{m.group(1)} {m.group(2).lower()}")
+    # Match standalone numbers not part of a ratio (not preceded/followed by ':')
+    for m in re.finditer(r"(?<![:\d\.])(\d+(?:\.\d+)?)(?![:\d])", text):
+        results.add(m.group(1))
+    return results
+
+
+def _numeric_magnitude_ok(requirement: str, evidence_text: str) -> bool:
+    """Check that every number+unit in the requirement is satisfied by the evidence.
+
+    For specs with "minimum", "or higher", "or more", "at least":
+      evidence value must be >= requirement value (same unit).
+    For all other specs:
+      evidence value must be >= requirement value (lenient — catches "equivalent").
+
+    Returns True if all requirement numbers are satisfied or if no numbers found.
+    Returns False if any required number is clearly NOT met (e.g. 1 MB vs 12 MB).
+    """
+    req_lower = requirement.lower()
+    is_minimum = any(kw in req_lower for kw in (
+        "minimum", "or higher", "or more", "at least", "min ", "min.", "upto", "up to"
+    ))
+
+    # Extract (value, unit) pairs from requirement
+    req_pairs: List[Tuple[float, str]] = []
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*([a-zA-Z]+)", requirement):
+        try:
+            req_pairs.append((float(m.group(1)), m.group(2).lower()))
+        except ValueError:
+            pass
+
+    if not req_pairs:
+        return True  # no numeric requirement to check
+
+    ev_lower = evidence_text.lower()
+    for req_val, req_unit in req_pairs:
+        # Find all evidence values with the same unit
+        ev_vals: List[float] = []
+        for m in re.finditer(
+            r"(\d+(?:\.\d+)?)\s*" + re.escape(req_unit) + r"\b",
+            ev_lower,
+        ):
+            try:
+                ev_vals.append(float(m.group(1)))
+            except ValueError:
+                pass
+
+        if not ev_vals:
+            # Unit not found in evidence at all — requirement cannot be confirmed
+            return False
+
+        best_ev = max(ev_vals)
+        if is_minimum:
+            # Evidence must meet or exceed the requirement
+            if best_ev < req_val:
+                return False
+        else:
+            # Exact or better — evidence must be >= requirement
+            if best_ev < req_val * 0.9:  # 10% tolerance for rounding
+                return False
+
+    return True
+
+
 def _verify_citation(citation: str, top_blocks_norm: Sequence[str], fallback: str = "") -> str:
+    """Return citation if it appears verbatim in one of the top blocks, else fallback."""
     normalized = _normalize_text(citation)
     if not normalized:
         return fallback
     for block_text in top_blocks_norm:
-        if normalized and normalized in block_text:
+        if normalized in block_text:
             return citation
     return fallback
 
@@ -156,11 +282,11 @@ def _top_blocks_from_index(spec_text: str, index: VendorIndex, limit: int = 5) -
     return [dict(index.blocks[idx]) for idx in top_indices], [index.block_texts_norm[idx] for idx in top_indices]
 
 
-def _trim_context(context: str, max_chars: int = 900) -> str:
+def _trim_context(context: str, max_chars: int = 3500) -> str:
     """Trim context to max_chars, cutting at a sentence boundary.
 
-    Default is 1500 chars — enough for a 1.5B model to reason well
-    without blowing the context window or slowing generation.
+    Default is 3500 chars — large enough to preserve meaningful vendor
+    paragraphs while keeping prompts reasonably sized.
     """
     if len(context) <= max_chars:
         return context
@@ -201,8 +327,8 @@ def _quick_evidence_verdict(requirement: str, top_blocks: Sequence[Dict[str, Any
 
     overlap = req_tokens & evidence_tokens
     overlap_ratio = len(overlap) / max(1, len(req_tokens))
-    req_numbers = set(re.findall(r"\d+(?:\.\d+)?", requirement))
-    evidence_numbers = set(re.findall(r"\d+(?:\.\d+)?", text))
+    req_numbers = _extract_spec_numbers(requirement)
+    evidence_numbers = _extract_spec_numbers(text)
     numbers_ok = not req_numbers or req_numbers <= evidence_numbers
 
     if overlap_ratio >= 0.18 and numbers_ok:
@@ -235,8 +361,8 @@ def _heuristic_overlap_eval(
 
     overlap = spec_tokens & block_tokens
     overlap_ratio = len(overlap) / max(1, len(spec_tokens))
-    req_numbers = set(re.findall(r"\d+(?:\.\d+)?", requirement))
-    evidence_numbers = set(re.findall(r"\d+(?:\.\d+)?", text))
+    req_numbers = _extract_spec_numbers(requirement)
+    evidence_numbers = _extract_spec_numbers(text)
     numbers_ok = not req_numbers or req_numbers <= evidence_numbers
 
     yes_threshold = _float_env("HEURISTIC_YES_RATIO", 0.25)
@@ -336,43 +462,57 @@ def dispatch_spec_vendor(
     if quick:
         _record_dispatch("quick")
         best_block = top_blocks[0] if top_blocks else {}
-        return {
-            "spec_id": spec_id,
-            "vendor_id": vendor_id,
-            "status": quick["status"],
-            "citation": quick["citation"],
-            "reasoning": quick["reasoning"],
-            "confidence": quick["confidence"],
-            "citation_page": best_block.get("page"),
-            "citation_bbox": best_block.get("bbox"),
-            "technical": {"status": quick["status"], "confidence": quick["confidence"]},
-            "risk": {},
-            "fallback": {},
-            "top_blocks": top_blocks,
-        }
+        return _make_dispatch_result(
+            spec_id,
+            vendor_id,
+            quick["status"],
+            quick["citation"],
+            quick["reasoning"],
+            quick["confidence"],
+            citation_page=best_block.get("page"),
+            citation_bbox=best_block.get("bbox"),
+            technical={"status": quick["status"], "confidence": quick["confidence"]},
+            risk={},
+            fallback={},
+            top_blocks=top_blocks,
+        )
 
     if fast:
         _record_dispatch("fast")
         best = top_blocks[0] if top_blocks else {}
+        best_text = best.get("text", "")
         spec_tokens = set(_tokenize(requirement))
-        block_tokens = set(_tokenize(best.get("text", "")))
+        block_tokens = set(_tokenize(best_text))
         overlap = spec_tokens & block_tokens
         score = (len(overlap) / max(1, len(spec_tokens))) if spec_tokens else 0.0
-        status = "YES" if score >= 0.2 else "NO"
-        return {
-            "spec_id": spec_id,
-            "vendor_id": vendor_id,
-            "status": status,
-            "citation": best.get("text", ""),
-            "reasoning": f"heuristic token overlap {len(overlap)} tokens",
-            "confidence": float(min(0.99, max(0.0, score))),
-            "citation_page": best.get("page"),
-            "citation_bbox": best.get("bbox"),
-            "technical": {},
-            "risk": {},
-            "fallback": {},
-            "top_blocks": top_blocks,
-        }
+
+        # Numeric magnitude check: "1 MB cache" must NOT satisfy "12 MB cache or higher"
+        magnitude_ok = _numeric_magnitude_ok(requirement, best_text)
+
+        if score >= 0.2 and magnitude_ok:
+            status = "YES"
+        elif score >= 0.2 and not magnitude_ok:
+            status = "NO"   # token overlap but numbers don't satisfy requirement
+        else:
+            status = "NO"
+
+        return _make_dispatch_result(
+            spec_id,
+            vendor_id,
+            status,
+            best_text,
+            (
+                f"heuristic token overlap {len(overlap)} tokens"
+                + ("" if magnitude_ok else "; numeric values do not meet requirement")
+            ),
+            float(min(0.99, max(0.0, score))) if magnitude_ok else 0.85,
+            citation_page=best.get("page"),
+            citation_bbox=best.get("bbox"),
+            technical={},
+            risk={},
+            fallback={},
+            top_blocks=top_blocks,
+        )
 
     if allow_model_shortcuts and _bool_env("LLM_ONLY_UNCERTAIN", False):
         heuristic = _heuristic_overlap_eval(requirement, top_blocks)
@@ -380,20 +520,20 @@ def dispatch_spec_vendor(
             _record_dispatch("heuristic")
             best_block = top_blocks[0] if top_blocks else {}
             citation = _verify_citation(heuristic.get("citation", ""), top_blocks_norm, best_block.get("text", ""))
-            return {
-                "spec_id": spec_id,
-                "vendor_id": vendor_id,
-                "status": heuristic["status"],
-                "citation": citation,
-                "reasoning": heuristic.get("reasoning", ""),
-                "confidence": heuristic.get("confidence", 0.5),
-                "citation_page": best_block.get("page"),
-                "citation_bbox": best_block.get("bbox"),
-                "technical": {"status": heuristic["status"], "confidence": heuristic.get("confidence", 0.5)},
-                "risk": {},
-                "fallback": {},
-                "top_blocks": top_blocks,
-            }
+            return _make_dispatch_result(
+                spec_id,
+                vendor_id,
+                heuristic["status"],
+                citation,
+                heuristic.get("reasoning", ""),
+                heuristic.get("confidence", 0.5),
+                citation_page=best_block.get("page"),
+                citation_bbox=best_block.get("bbox"),
+                technical={"status": heuristic["status"], "confidence": heuristic.get("confidence", 0.5)},
+                risk={},
+                fallback={},
+                top_blocks=top_blocks,
+            )
 
     # ── single-call LLM path (1 call instead of 4) ──────────────────────────
     if allow_model_shortcuts and is_healthy():
@@ -403,20 +543,20 @@ def dispatch_spec_vendor(
             _record_dispatch("llm_single")
             best_block = top_blocks[0] if top_blocks else {}
             citation = _verify_citation(judged.get("citation", ""), top_blocks_norm, best_block.get("text", ""))
-            return {
-                "spec_id": spec_id,
-                "vendor_id": vendor_id,
-                "status": judged["status"],
-                "citation": citation,
-                "reasoning": judged.get("reasoning", ""),
-                "confidence": judged.get("confidence", 0.5),
-                "citation_page": best_block.get("page"),
-                "citation_bbox": best_block.get("bbox"),
-                "technical": {"status": judged["status"], "confidence": judged.get("confidence", 0.5)},
-                "risk": {},
-                "fallback": {},
-                "top_blocks": top_blocks,
-            }
+            return _make_dispatch_result(
+                spec_id,
+                vendor_id,
+                judged["status"],
+                citation,
+                judged.get("reasoning", ""),
+                judged.get("confidence", 0.5),
+                citation_page=best_block.get("page"),
+                citation_bbox=best_block.get("bbox"),
+                technical={"status": judged["status"], "confidence": judged.get("confidence", 0.5)},
+                risk={},
+                fallback={},
+                top_blocks=top_blocks,
+            )
 
     # ── multi-agent path (fallback when single-call fails or LLM is down) ───
     _record_dispatch("llm_multi")
